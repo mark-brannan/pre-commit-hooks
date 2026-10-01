@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Repo-only lint rules. Safe to run anywhere, including CI.
+
+Each rule here exists because its absence already cost real time. They are
+deliberately generic: none of them know anything about the consuming repo's
+layout beyond which files to read (.gitattributes, git config). A rule that
+only makes sense in one repo belongs in that repo as a `repo: local` hook.
+
+Scope: by default each rule looks only at what THIS commit stages, because
+a hook that blocks on repo-wide state punishes whoever commits next rather
+than whoever caused it. `--all` checks everything and is what CI runs.
+
+Usage:  hooks/lint_repo_hygiene.py [--all] [--warn-only]
+
+Adding a rule: write a `rule_*` function that calls fail()/warn(), and add
+it to the tuple in main(). tests/test_repo_hygiene.py shows the fixtures.
+"""
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import secretguard  # noqa: E402  -- needs the sys.path line above
+
+ROOT = Path(secretguard.REPO)
+
+CI = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
+
+failures: list[str] = []
+warnings: list[str] = []
+
+SCOPE_ALL = False
+
+
+def in_scope() -> set[str] | None:
+    """What this run is allowed to look at: staged paths, or None for all.
+
+    None means "everything is in scope" and is deliberately what both the
+    --all flag and a failed `git diff` produce -- a broken git invocation
+    must never silently narrow a guard to nothing.
+    """
+    return None if SCOPE_ALL else staged_paths()
+
+
+def _fnmatch_any(path: str, patterns) -> bool:
+    """Does `path` match any of these .gitattributes patterns?
+
+    Patterns are globs, and a bare `*.sops.yaml` is matched against the
+    basename as git does, not just against the full path.
+
+    Deliberately looser than git in one place: python's `*` crosses `/`
+    where git's does not, so a pattern like `secrets/*.sops.yaml` matches
+    `secrets/nested/foo.sops.yaml` here and would not be filtered by git.
+    That over-matches, and over-matching is the safe direction for this
+    rule -- the cost is a spurious block naming a file, which the message's
+    `git restore --staged` exit clears in one command; the cost of
+    under-matching is a plaintext secret committed to a public repo with no
+    warning at all. Left as-is rather than reached for with
+    fnmatch.translate, which would buy exactness in the direction we do not
+    want. Moot today: every entry in .gitattributes is a literal path.
+    """
+    from fnmatch import fnmatch
+    return any(fnmatch(path, pat) or fnmatch(os.path.basename(path), pat)
+               for pat in patterns)
+
+
+def staged_paths() -> set[str] | None:
+    """Repo-relative paths this commit stages, or None if git can't say.
+
+    None means "scope unknown", and every caller then behaves as if
+    everything is in scope. A broken git invocation must never be the thing
+    that quietly switches a guard off.
+    """
+    result = subprocess.run(
+        # -z, not --name-only alone: git quotes any path outside plain
+        # ASCII (core.quotePath defaults on), so `caf\u00e9.md` came back as
+        # a quoted display string and never matched a covered path. A guard
+        # that silently drops a file from its own scope fails open, which is
+        # the one direction these must not fail.
+        #
+        # --diff-filter=d: a staged deletion puts no content into git, so
+        # it is never a finding -- and naming a deleted file in a "fix it
+        # like this" message is just wrong.
+        ["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=d"],
+        # Explicit UTF-8, not the locale's guess: git emits paths as UTF-8
+        # bytes, and under LC_ALL=C with PEP 538 coercion off, text=True
+        # decodes as ASCII and raises UnicodeDecodeError on `caf\u00e9.md`.
+        # That crashed the guard with a traceback -- the exact failure this
+        # whole change exists to stop. surrogateescape so a path that is
+        # not valid UTF-8 either round-trips instead of exploding.
+        cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape",
+    )
+    if result.returncode != 0:
+        return None
+    return {name for name in result.stdout.split("\0") if name}
+
+
+def staged_blob(path: str) -> str | None:
+    """Git's recorded text for `path`, or None if it can't be read.
+
+    None means "fall back to the working tree" -- for an unstaged or
+    untracked file there is nothing in the index to judge.
+    """
+    r = subprocess.run(
+        ["git", "show", f":{path}"], cwd=ROOT, capture_output=True,
+        text=True, encoding="utf-8", errors="surrogateescape",
+    )
+    return r.stdout if r.returncode == 0 else None
+
+
+def gitattributes_filters() -> dict[str, list[str]]:
+    """{filter name: [paths it covers]}, straight out of .gitattributes.
+
+    Read here rather than from .sops.yaml so these rules keep working with
+    no pyyaml -- which is exactly the clone they most need to work on.
+    """
+    ga = ROOT / ".gitattributes"
+    declared: dict[str, list[str]] = {}
+    if not ga.exists():
+        return declared
+    for line in ga.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for match in re.finditer(r"(?:^|\s)filter=(\S+)", line):
+            declared.setdefault(match.group(1), []).append(line.split()[0])
+    return declared
+
+
+def fail(rule: str, msg: str) -> None:
+    failures.append(f"{rule}: {msg}")
+
+
+def warn(rule: str, msg: str) -> None:
+    warnings.append(f"{rule}: {msg}")
+
+
+def filter_is_configured(name: str) -> bool:
+    """Does this clone actually have filter.<name>.clean wired up?
+
+    Its own function so the tests can force the unconfigured case. Asserting
+    on a real clone would pass vacuously on any machine that HAS the filters
+    -- which is every maintainer's, and the one place these tests would then
+    never run.
+    """
+    return bool(subprocess.run(
+        ["git", "config", "--get", f"filter.{name}.clean"],
+        cwd=ROOT, capture_output=True, text=True,
+    ).stdout.strip())
+
+
+def rule_declared_filters_are_configured() -> None:
+    """A .gitattributes filter that git doesn't have configured is a trap.
+
+    The declared transform silently does not happen: content the repo says
+    is encrypted-on-commit goes in as plaintext, and nothing says so. This
+    is not a sops rule -- it applies identically to git-lfs, git-crypt, or
+    any clean/smudge pair.
+
+    Found unconfigured on the boat Pi on 2026-08-14, in a public repo.
+
+    Skipped in CI, which legitimately has no filters: CI never commits, and
+    a fresh checkout is expected to lack them.
+    """
+    if CI or not (ROOT / ".gitattributes").exists():
+        return
+
+    declared = gitattributes_filters()
+    scope = in_scope()
+    for name in sorted(declared):
+        if filter_is_configured(name):
+            continue
+
+        # Two axes -- this is the one place PR #12's and #13's reworks of
+        # this rule could have cancelled each other out.
+        #
+        #   MODE  says who is committing        (contributor / strict)
+        #   SCOPE says what is in this commit   (does it stage a covered path)
+        #
+        # The invariant, agreed across both:
+        #   enforcement may soften a guard about your ENVIRONMENT;
+        #   it may never soften one about the CONTENT of your commit.
+        #
+        # So a staged covered path BLOCKS in every mode, contributor
+        # included -- that is the 2026-08-14 incident (plaintext secrets into
+        # a public repo) and it is content. An unconfigured filter with
+        # nothing covered staged is environment: strict blocks, contributor
+        # warns, and a contributor can still commit a markdown typo fix.
+        #
+        # Taking either axis alone loses something real: mode alone lets a
+        # contributor stage a plaintext secret with only a warning here;
+        # scope alone stops strict mode complaining about a clone that isn't
+        # wired up yet.
+        #
+        # scope is None means "everything" -- --all, or a git call that
+        # failed. Both must widen the rule, never narrow it to nothing.
+        hits = sorted(declared[name]) if scope is None else sorted(
+            p for p in scope if _fnmatch_any(p, declared[name])
+        )
+        blocking = bool(hits) or secretguard.mode() == "strict"
+
+        if hits:
+            first = hits[0]
+            message = secretguard.format(
+                "BLOCKED",
+                "this commit stages a file whose git filter isn't configured",
+                problem=f".gitattributes routes it through filter={name}, but "
+                        f"filter.{name}.clean is unset in this clone, so it "
+                        f"would be committed UNTRANSFORMED -- for filter=sops, "
+                        f"that means in plaintext",
+                file=hits,
+                needs=f"filter.{name}.clean in this clone's .git/config",
+                blocked_by="pre-commit hook 'repo-hygiene' "
+                           "(hooks/lint_repo_hygiene.py)",
+                fix="bash scripts/setup-git-filters.sh, then: "
+                    f"git add --renormalize {first}",
+                if_stuck="no sops or age key here, or you didn't stage it? Take "
+                         "it out of this commit and everything else goes "
+                         f"through: git restore --staged {first} -- or commit "
+                         "only your own paths: git commit -m ... -- <your "
+                         "paths>. Last resort: SKIP=repo-hygiene git commit ...",
+                see="README.md, Setup -- or bash scripts/check_clone_setup.sh",
+            )
+        else:
+            message = secretguard.format(
+                "BLOCKED" if blocking else "warning",
+                "a declared git filter is not configured in this clone",
+                problem=f".gitattributes declares filter={name} and "
+                        f"filter.{name}.clean is unset. Nothing in this commit "
+                        f"is covered by it, so nothing is at risk right now",
+                needs=f"filter.{name}.clean in this clone's .git/config",
+                blocked_by="pre-commit hook 'repo-hygiene' "
+                           "(hooks/lint_repo_hygiene.py)",
+                fix="bash scripts/setup-git-filters.sh, before you commit a "
+                    "covered file",
+                if_stuck="SKIP=repo-hygiene git commit ...   (last resort: "
+                         "git commit --no-verify)",
+                see="README.md, Setup -- or bash scripts/check_clone_setup.sh",
+            )
+        (failures if blocking else warnings).append(message)
+
+
+def rule_plaintext_secrets_are_protectable() -> None:
+    """Secrets sitting in the clear on a machine that cannot re-encrypt them.
+
+    Every other check here fires when you touch something. This one is about
+    a standing condition, and it is the one that fails late otherwise: a
+    machine that HAD a key and lost it -- sops uninstalled, keys.txt gone,
+    SOPS_AGE_KEY_FILE unset in a new shell -- has real secrets decrypted on
+    disk and no way to put them back. Nothing says so until someone happens
+    to stage one of those files, which may be days later and may be a
+    `git add .`.
+
+    So: check the state, not the operation, and say it on the first commit.
+
+    Cannot false-positive on a keyless contributor clone, which is the case
+    it must not annoy -- there the covered files are still ciphertext, so
+    there is nothing in the clear to protect. It takes both halves.
+    """
+    if CI:
+        return  # a fresh checkout is ciphertext by definition
+    covered = gitattributes_filters().get("sops", [])
+    if not covered:
+        return
+
+    missing = []
+    if not secretguard.find_sops():
+        missing.append(secretguard.sops_locations())
+    if not secretguard.have_age_key():
+        missing.append("an age key (~/.config/sops/age/keys.txt, or SOPS_AGE_KEY_FILE)")
+    if not missing:
+        return
+
+    exposed = []
+    for rel in covered:
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Both output forms, and the metadata shape rather than the word --
+        # see secretguard.is_sops_encrypted. Getting this wrong is bad in
+        # both directions: too loose and a plaintext file mentioning sops
+        # reads as encrypted, too tight and an encrypted YAML file reads as
+        # plaintext and blocks every commit.
+        if not secretguard.is_sops_encrypted(text):
+            exposed.append(rel)
+    if not exposed:
+        return
+
+    failures.append(secretguard.format(
+        "BLOCKED",
+        "decrypted secrets are on disk and this machine cannot re-encrypt them",
+        problem="these files hold real credentials in the clear right now, and "
+                "nothing here can put them back. Any commit is one `git add .` "
+                "away from publishing them, so this blocks every commit rather "
+                "than waiting for the one that stages them",
+        file=exposed,
+        needs=", ".join(missing),
+        blocked_by="pre-commit hook 'repo-hygiene' (hooks/lint_repo_hygiene.py)",
+        fix="restore what 'needs' lists, then: bash scripts/setup-git-filters.sh",
+        if_stuck="if the plaintext is stale rather than live, delete those files "
+                 "and `git checkout --` them to get the encrypted form back. To "
+                 "commit anyway: SKIP=repo-hygiene git commit ... (CI's gitleaks "
+                 "and trufflehog passes still run on a PR)",
+        see="bash scripts/check_clone_setup.sh",
+    ))
+
+
+
+def main() -> int:
+    global SCOPE_ALL
+    warn_only = "--warn-only" in sys.argv
+    SCOPE_ALL = "--all" in sys.argv
+    for rule in (
+        rule_declared_filters_are_configured,
+        rule_plaintext_secrets_are_protectable,
+    ):
+        rule()
+
+    # Rules that use secretguard already produce a formatted block; the
+    # short ones are one-liners and get the compact prefix.
+    for w in warnings:
+        print(w if "\n" in w else f"  warn  {w}")
+    for f in failures:
+        print(f if "\n" in f else f"  FAIL  {f}")
+
+    if failures and not warn_only:
+        scope_note = ("across the whole repo" if SCOPE_ALL
+                      else "in what this commit stages")
+        print(f"\nrepo-hygiene: BLOCKED on {len(failures)} problem(s) "
+              f"{scope_note}.")
+        print("Each fix above includes a way out if you can't run it. Failing "
+              "that, `git commit --no-verify` bypasses all hooks.")
+        return 1
+    if not failures and not warnings:
+        print("repo hygiene: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
