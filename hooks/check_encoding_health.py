@@ -265,7 +265,7 @@ def _report(path, what, staged=True, extra=None):
         # Paths are shell-quoted: these lines get copied into a terminal,
         # and a path with a space silently becomes two arguments. `--`
         # keeps a leading-dash filename from being read as a flag.
-        fix=(f"python3 hooks/check_encoding_health.py --fix {q}"
+        fix=(f"python3 {shlex.quote(os.path.abspath(__file__))} --fix {q}"
              + (f" && git add -- {q}" if staged else "")),
         if_stuck=(
             f"didn't cause it, or the fix looks wrong? Drop the file and the "
