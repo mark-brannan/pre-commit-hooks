@@ -53,3 +53,12 @@
   pass_filenames: false
   always_run: true
   stages: [pre-commit, manual]
+
+- id: vuln-shape
+  name: vuln-shape (no security findings about a specific host)
+  description: Blocks an exposure claim next to a specific host, or a pending access-request ID, in lines this commit adds; --all for every tracked file.
+  entry: hooks/check_vuln_shape.py
+  language: script
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit, manual]
