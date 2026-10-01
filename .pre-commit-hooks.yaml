@@ -1,0 +1,55 @@
+# Hooks for consumers. Every hook scopes itself from `git diff --cached` (or
+# the pushed range), so none takes filenames and all are always_run: a
+# `files:` filter would not fire on a commit that only deletes a covered path.
+#
+# language: script runs the file straight from pre-commit's clone of this
+# repo -- no virtualenv, no network beyond the clone. Python hooks need only
+# the stdlib; the shell hooks need bash, git and grep (gitleaks also docker,
+# and degrades without it -- see hooks/secretguard.sh).
+#
+# CI variants: pass args in the consumer's config, e.g.
+#   - id: repo-hygiene
+#     alias: repo-hygiene-all
+#     args: [--all]
+#     stages: [manual]
+# then `pre-commit run --hook-stage manual repo-hygiene-all --all-files`.
+#
+# Adding a hook: a script under hooks/, its test under tests/, an entry here.
+# CI (.github/workflows/ci.yml) picks up tests/test_*.py by glob.
+
+- id: gitleaks
+  name: gitleaks (scan staged changes for secrets)
+  description: Pinned gitleaks image over the staged diff, --redact; degrades without docker.
+  entry: hooks/gitleaks_precommit.sh
+  language: script
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit]
+
+- id: prepush-secret-scan
+  name: pre-push secret scan (every commit being published)
+  description: Scans every commit in the pushed range for never-tracked files, unencrypted secrets and cleartext credentials.
+  entry: hooks/prepush_secret_scan.sh
+  language: script
+  pass_filenames: false
+  always_run: true
+  stages: [pre-push]
+
+- id: repo-hygiene
+  name: repo hygiene (declared filters are configured)
+  description: Blocks when a .gitattributes filter has no git config, so its transform would silently not happen.
+  entry: hooks/lint_repo_hygiene.py
+  language: script
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit, manual]
+
+- id: encoding-health
+  name: encoding (staged files are UTF-8, no mojibake)
+  description: Catches latin-1 round-trip damage in what this commit stages; --repo for all tracked files.
+  entry: hooks/check_encoding_health.py
+  args: [--staged]
+  language: script
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit, manual]
