@@ -20,6 +20,7 @@ repos:
       - id: prepush-secret-scan
       - id: repo-hygiene
       - id: encoding-health
+      - id: vuln-shape
 ```
 
 Then `pre-commit install` and check it worked:
@@ -34,6 +35,7 @@ pre-commit run --all-files   # every hook prints Passed or Skipped
 | `prepush-secret-scan` | pre-push | never-tracked files, unencrypted sops files, cleartext credentials in any pushed commit |
 | `repo-hygiene` | pre-commit | a `.gitattributes` filter git has no config for |
 | `encoding-health` | pre-commit | non-UTF-8 or mojibake in staged files |
+| `vuln-shape` | pre-commit | an exposure claim (unauthenticated, firewall off, default password, CVE) next to a specific host, or a pending access-request ID, in added lines |
 
 Every hook judges only what this commit stages (or this push publishes).
 Repo-wide state is CI's job: `hooks/lint_repo_hygiene.py --all` and
@@ -56,6 +58,10 @@ gate.
   `docker/gitleaks/Dockerfile` `FROM` line, else this repo's.
 - **gitleaks rules**: a `.gitleaks.toml` at the consuming repo's root is
   passed with `--config`.
+- **vuln-shape allows**: `vuln-shape: allow` on or within three lines of a
+  hit, or a path glob in `.vuln-shape-allow` at the repo root. Allowed hits
+  still print as notes. Placeholders (`example.com`, `192.0.2.x`) never
+  count as a host, so writing examples with them needs no allow.
 
 Block messages point at the consuming repo's own docs (`RUNBOOK.md`,
 `scripts/setup-git-filters.sh`) for the sops paths; those only fire in

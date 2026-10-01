@@ -29,6 +29,7 @@ jobs:
         run: |
           hooks/lint_repo_hygiene.py --all
           hooks/check_encoding_health.py --repo
+          hooks/check_vuln_shape.py --all
       - name: manifest loads in pre-commit
         run: |
           pip install pre-commit
